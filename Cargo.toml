@@ -1,0 +1,9 @@
+[package]
+name = "ni-service-rs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+dotenvy = "0.15"
+notify = "6"
+windows-service = "0.6"
