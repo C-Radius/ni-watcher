@@ -2,10 +2,10 @@
 setlocal
 
 REM Prompt user for folder to monitor
-set /p WATCH_FOLDER=Enter the full path to the folder to watch (e.g. C:\Images):
+set /p WATCH_FOLDER="C:\ΦΩΤΟ SOFT1\"
 
 REM Set default install directory
-set TARGET_DIR=C:\Program Files\ni-watcher
+set TARGET_DIR=C:\ProgramData\ni-watcher
 
 REM Create target directory if it doesn't exist
 if not exist "%TARGET_DIR%" mkdir "%TARGET_DIR%"

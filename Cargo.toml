@@ -7,3 +7,8 @@ edition = "2024"
 dotenvy = "0.15"
 notify = "6"
 windows-service = "0.6"
+tokio = { version = "1.44", features = ["full"] } # Enables all Tokio features
+simplelog = "0.12" # For logging
+once_cell = "1.18" # For Lazy static initialization
+image = "0.24"
+log = "0.4"
