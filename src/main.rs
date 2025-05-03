@@ -249,6 +249,13 @@ fn process_and_save(path: &PathBuf, size: (u32, u32), pad: u32, tol: u8) -> Resu
         return Err(format!("File not found: {:?}", path));
     }
 
+    let original_path_extension = path.extension();
+    let output_format_extension = env::var("OUTPUT_FORMAT").unwrap_or_else(|_| {
+        original_path_extension
+            .map(|ext| ext.to_string_lossy().to_string())
+            .unwrap_or_else(|| "jpg".to_string())
+    });
+
     log::info!("Processing file: {:?}", path);
     let mut retries = 0;
     const MAX_RETRIES: u32 = 5;
@@ -304,8 +311,10 @@ fn process_and_save(path: &PathBuf, size: (u32, u32), pad: u32, tol: u8) -> Resu
     log::info!("Image processed successfully: {:?}", path);
 
     let mut tmp_path = path.clone();
+    let mut cleanup_path = path.clone();
+
     if let Some(extension) = path.extension() {
-        let new_extension = format!("normalized.{}", extension.to_string_lossy());
+        let new_extension = format!("normalized.{}", output_format_extension);
         tmp_path.set_extension(new_extension);
     } else {
         log::error!(
@@ -332,7 +341,21 @@ fn process_and_save(path: &PathBuf, size: (u32, u32), pad: u32, tol: u8) -> Resu
     }
     log::info!("Temporary processed image saved: {:?}", tmp_path);
 
-    fs::rename(&tmp_path, path).map_err(|e| format!("Failed to replace original file {:?}: {}", path, e))?;
+    let mut final_path = path.clone();
+
+    final_path.set_extension(env::var("OUTPUT_FORMAT").unwrap_or_else(|_| {
+        path.extension()
+            .map(|ext| ext.to_string_lossy().to_string())
+            .unwrap_or_else(|| "png".to_string())
+    }));
+
+    fs::rename(&tmp_path, final_path).unwrap();
+
+    if cleanup_path.exists() {
+        log::info!("Cleaning up original file since it was of different format than the output format.");
+        fs::remove_file(&cleanup_path).unwrap();
+    }
+
     log::info!("Successfully replaced original file with processed image: {:?}", path);
 
     Ok(())
