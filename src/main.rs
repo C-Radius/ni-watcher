@@ -1,5 +1,6 @@
-use image::{imageops::FilterType, DynamicImage, GenericImage, GenericImageView, Rgba};
 use image::io::Reader as ImageReader;
+use image::{imageops::FilterType, DynamicImage, GenericImage, GenericImageView, Rgba};
+use log;
 use notify::{
     event::{EventKind, ModifyKind},
     Config, Event, RecommendedWatcher, RecursiveMode, Watcher,
@@ -24,7 +25,6 @@ use windows_service::service::{
 };
 use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
 use windows_service::service_dispatcher;
-use log;
 
 static SHUTDOWN: Lazy<AtomicBool> = Lazy::new(|| AtomicBool::new(false));
 static RECENTLY_PROCESSED: Lazy<Mutex<HashSet<String>>> = Lazy::new(|| Mutex::new(HashSet::new()));
@@ -148,7 +148,8 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn handle_file_event(event: Event, debounce_duration: Duration) {
-    static PENDING_FILES: Lazy<Mutex<HashMap<PathBuf, Instant>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+    static PENDING_FILES: Lazy<Mutex<HashMap<PathBuf, Instant>>> =
+        Lazy::new(|| Mutex::new(HashMap::new()));
 
     match event.kind {
         EventKind::Create(_) | EventKind::Modify(ModifyKind::Any) => {
@@ -190,8 +191,9 @@ fn handle_file_event(event: Event, debounce_duration: Duration) {
 
 fn load_env() {
     let env_file = current_exe_dir().join(".env");
-    if env_file.exists() {
-        let _ = dotenvy::from_path(env_file);
+    match dotenvy::from_path(&env_file) {
+        Ok(_) => println!(".env loaded from {:?}", env_file),
+        Err(e) => println!("Warning: failed to load .env from {:?}: {}", env_file, e),
     }
 }
 
@@ -249,57 +251,80 @@ fn process_and_save(path: &PathBuf, size: (u32, u32), pad: u32, tol: u8) -> Resu
         return Err(format!("File not found: {:?}", path));
     }
 
-    let original_path_extension = path.extension();
-    let output_format_extension = env::var("OUTPUT_FORMAT").unwrap_or_else(|_| {
-        original_path_extension
-            .map(|ext| ext.to_string_lossy().to_string())
-            .unwrap_or_else(|| "jpg".to_string())
-    });
+    let output_ext_lc = env::var("OUTPUT_FORMAT")
+        .unwrap_or_else(|_| "jpg".to_string())
+        .to_lowercase();
+
+    let format = match output_ext_lc.as_str() {
+        "jpg" | "jpeg" => image::ImageFormat::Jpeg,
+        "png" => image::ImageFormat::Png,
+        "gif" => image::ImageFormat::Gif,
+        "bmp" => image::ImageFormat::Bmp,
+        "tiff" => image::ImageFormat::Tiff,
+        "webp" => image::ImageFormat::WebP,
+        other => {
+            log::error!("Unsupported output format: {}", other);
+            return Err(format!("Unsupported output format: {}", other));
+        }
+    };
+
+    let stem = path
+        .file_stem()
+        .ok_or_else(|| {
+            log::error!("Missing filename stem in {:?}", path);
+            format!("Missing filename stem in {:?}", path)
+        })?
+        .to_str()
+        .ok_or_else(|| {
+            log::error!("Non-UTF8 filename in {:?}", path);
+            format!("Non-UTF8 filename in {:?}", path)
+        })?;
 
     log::info!("Processing file: {:?}", path);
-    let mut retries = 0;
+
     const MAX_RETRIES: u32 = 5;
-    const RETRY_DELAY: u64 = 200;
+    const RETRY_DELAY_MS: u64 = 200;
+    let mut retries = 0;
 
     let img = loop {
         match ImageReader::open(path) {
             Ok(reader) => match reader.decode() {
                 Ok(img) => break img,
                 Err(e) if retries < MAX_RETRIES => {
+                    retries += 1;
                     log::warn!(
                         "Failed to decode image {:?} on attempt {}: {}. Retrying...",
                         path,
-                        retries + 1,
+                        retries,
                         e
                     );
-                    retries += 1;
-                    thread::sleep(Duration::from_millis(RETRY_DELAY));
+                    thread::sleep(Duration::from_millis(RETRY_DELAY_MS));
                 }
                 Err(e) => {
                     log::error!(
                         "Failed to decode image {:?} after {} attempts: {}",
                         path,
-                        MAX_RETRIES,
+                        retries,
                         e
                     );
                     return Err(format!("Failed to decode image {:?}: {}", path, e));
                 }
             },
             Err(e) if retries < MAX_RETRIES => {
+                retries += 1;
                 log::warn!(
                     "Failed to open image {:?} on attempt {}: {}. Retrying...",
                     path,
-                    retries + 1,
+                    retries,
                     e
                 );
-                retries += 1;
-                thread::sleep(Duration::from_millis(RETRY_DELAY));
+                thread::sleep(Duration::from_millis(RETRY_DELAY_MS));
             }
             Err(e) => {
                 log::error!(
                     "Failed to open image {:?} after {} attempts: {}",
                     path,
-                    MAX_RETRIES,
+                    retries,
                     e
                 );
                 return Err(format!("Failed to open image {:?}: {}", path, e));
@@ -310,54 +335,44 @@ fn process_and_save(path: &PathBuf, size: (u32, u32), pad: u32, tol: u8) -> Resu
     let processed_image = process_image(img, size, pad, tol);
     log::info!("Image processed successfully: {:?}", path);
 
-    let mut tmp_path = path.clone();
-    let mut cleanup_path = path.clone();
+    let tmp_filename = format!("{}.normalized.{}", stem, &output_ext_lc);
+    let tmp_path = path.with_file_name(&tmp_filename);
 
-    if let Some(extension) = path.extension() {
-        let new_extension = format!("normalized.{}", output_format_extension);
-        tmp_path.set_extension(new_extension);
-    } else {
-        log::error!(
-            "Failed to determine file extension for {:?}. Skipping file.",
-            path
-        );
-        return Err(format!(
-            "Failed to determine file extension for {:?}",
-            path
-        ));
+    let tmp_file = fs::File::create(&tmp_path)
+        .map_err(|e| format!("Failed to create temp file {:?}: {}", tmp_path, e))?;
+
+    if let Err(e) = processed_image.write_to(&mut std::io::BufWriter::new(tmp_file), format) {
+        log::error!("Failed to write image in {:?} format: {}", format, e);
+        return Err(format!("Failed to write image to {:?}: {}", tmp_path, e));
     }
 
-    if let Err(e) = processed_image.save(&tmp_path) {
-        log::error!(
-            "Failed to save processed image {:?}: {}",
-            tmp_path,
-            e
-        );
-        return Err(format!(
-            "Failed to save processed image {:?}: {}",
-            tmp_path,
-            e
-        ));
-    }
     log::info!("Temporary processed image saved: {:?}", tmp_path);
 
-    let mut final_path = path.clone();
+    let final_filename = format!("{}.{}", stem, &output_ext_lc);
+    let final_path = path.with_file_name(&final_filename);
 
-    final_path.set_extension(env::var("OUTPUT_FORMAT").unwrap_or_else(|_| {
-        path.extension()
-            .map(|ext| ext.to_string_lossy().to_string())
-            .unwrap_or_else(|| "png".to_string())
-    }));
+    fs::rename(&tmp_path, &final_path)
+        .map_err(|e| format!("Failed to rename to {:?}: {}", final_path, e))?;
 
-    fs::rename(&tmp_path, final_path).unwrap();
+    log::info!("Final processed image saved: {:?}", final_path);
 
-    if cleanup_path.exists() {
-        log::info!("Cleaning up original file since it was of different format than the output format.");
-        fs::remove_file(&cleanup_path).unwrap();
+    if path.as_path() != final_path && path.exists() {
+        log::info!(
+            "Removing original file {:?} due to output being saved separately as {:?}",
+            path,
+            final_path
+        );
+        fs::remove_file(path)
+            .map_err(|e| format!("Failed to remove original file {:?}: {}", path, e))?;
+    } else {
+        log::info!(
+            "Original file {:?} has been replaced by processed file {:?}",
+            path,
+            final_path
+        );
     }
 
-    log::info!("Successfully replaced original file with processed image: {:?}", path);
-
+    log::info!("Processing complete for {:?}", path);
     Ok(())
 }
 
@@ -407,7 +422,12 @@ fn bounding_box(img: &image::GrayImage, tol: u8) -> (u32, u32, u32, u32) {
             }
         }
     }
-    (left.min(width - 1), top.min(height - 1), (right + 1).min(width), (bottom + 1).min(height))
+    (
+        left.min(width - 1),
+        top.min(height - 1),
+        (right + 1).min(width),
+        (bottom + 1).min(height),
+    )
 }
 
 struct RollingFileLogger;
